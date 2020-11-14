@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/types.h> 
 #include <sys/stat.h> 
+#include <time.h>
  
 #define BUFFER_SIZE 65507
 
@@ -18,7 +19,18 @@
 
 #define HEADER_LENGTH (NAME_WIDTH+TIME_WIDTH)
 
-int writeFile(char *name, char *time, char *gzip, int gzipLength)
+char *getCurrentTime(char timestamp[], int len)
+{
+     time_t now = time(0);
+     struct tm ttm;
+     struct tm *tmptr = localtime_r(&now, &ttm);
+     snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d", ttm.tm_year + 1900,
+		 ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min); 
+     //snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
+     return timestamp;
+}
+
+int createDir(char *name)
 {
     if (access(name, W_OK) != 0)  
     {  
@@ -28,9 +40,29 @@ int writeFile(char *name, char *time, char *gzip, int gzipLength)
             return -1;   
         }
     }
+    return 0;
+}
 
+int writeFile(char *name, char *time, char *gzip, int gzipLength)
+{
     char fileName[512] = {0};
     strcpy(fileName, name);
+
+    if (0 != createDir(fileName))
+    {
+        return -1;
+    }
+
+    char currentTime[64] = {0};
+    getCurrentTime(currentTime, sizeof(currentTime));
+    strcat(fileName, "/");
+    strcat(fileName, currentTime);
+
+    if (0 != createDir(fileName))
+    {
+        return -1;
+    }
+
     strcat(fileName, "/");
     strcat(fileName, time);
     printf("fileName:%s\n", fileName);
