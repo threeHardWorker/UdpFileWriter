@@ -65,6 +65,7 @@ int writeFile(char *name, char *time, char *gzip, int gzipLength)
 
     strcat(fileName, "/");
     strcat(fileName, time);
+    strcat(fileName, ".gz");
     printf("fileName:%s\n", fileName);
     FILE *file = fopen(fileName, "wb");
     if (file)
