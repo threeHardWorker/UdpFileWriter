@@ -12,7 +12,7 @@
 #include <sys/stat.h> 
 #include <time.h>
  
-#define BUFFER_SIZE 65507
+#define RECV_BUFFER_SIZE 65507
 
 #define NAME_WIDTH 64
 #define TIME_WIDTH 13
@@ -24,8 +24,8 @@ char *getCurrentTime(char timestamp[], int len)
      time_t now = time(0);
      struct tm ttm;
      struct tm *tmptr = localtime_r(&now, &ttm);
-     snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d", ttm.tm_year + 1900,
-		 ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min); 
+     snprintf(timestamp, len, "%04d-%02d-%02d", ttm.tm_year + 1900,
+		 ttm.tm_mon + 1, ttm.tm_mday); 
      //snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
      return timestamp;
 }
@@ -43,7 +43,7 @@ int createDir(char *name)
     return 0;
 }
 
-int writeFile(char *name, char *time, char *gzip, int gzipLength)
+int writeFile(char *name, char *time, char *gzip, uint32_t gzipLength)
 {
     char fileName[512] = {0};
     strcpy(fileName, name);
@@ -58,18 +58,21 @@ int writeFile(char *name, char *time, char *gzip, int gzipLength)
     strcat(fileName, "/");
     strcat(fileName, currentTime);
 
-    if (0 != createDir(fileName))
+    /*if (0 != createDir(fileName))
     {
         return -1;
     }
 
     strcat(fileName, "/");
     strcat(fileName, time);
-    strcat(fileName, ".gz");
+    strcat(fileName, ".gz");*/
     printf("fileName:%s\n", fileName);
-    FILE *file = fopen(fileName, "wb");
+    FILE *file = fopen(fileName, "ab");
     if (file)
     {
+        uint32_t len = (uint32_t)(gzipLength+TIME_WIDTH);
+        fwrite((void*)(&len), 1, sizeof(uint32_t), file);
+        fwrite(time, 1, TIME_WIDTH, file);
         fwrite(gzip, 1, gzipLength, file);
         fclose(file);
     }
@@ -144,7 +147,7 @@ int main(int argc, char** argv)
 
     printf("Welcome! This is a UDP server, I can only received message from client and write to file\n");
 
-    char *buff = (char*)malloc(BUFFER_SIZE);
+    char *buff = (char*)malloc(RECV_BUFFER_SIZE);
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
     size_t len = 0;
@@ -156,7 +159,7 @@ int main(int argc, char** argv)
 
     while (1)
     {
-        len = recvfrom(sock, buff, BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
+        len = recvfrom(sock, buff, RECV_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
         if (len > 0)
         {
             if (len > HEADER_LENGTH)
