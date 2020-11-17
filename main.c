@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -9,15 +9,45 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/types.h> 
-#include <sys/stat.h> 
+#include <sys/stat.h>
 #include <time.h>
- 
-#define RECV_BUFFER_SIZE 65507
+#include <pthread.h>
+#include <atomic> 
+
+#define UDP_BUFFER_SIZE 65507
+#define RECV_BUFFER_SIZE (5*1024*1024)
+#define WRITE_BUFFER_TO_DISK_SIZE (0.8*RECV_BUFFER_SIZE)
 
 #define NAME_WIDTH 64
 #define TIME_WIDTH 13
 
 #define HEADER_LENGTH (NAME_WIDTH+TIME_WIDTH)
+
+#define RECV_BUFFER_COUNT 2
+
+std::atomic<int> writeFlag(0);
+
+char *g_bufferToWrite = NULL;
+int g_bufferToWriteLength = 0;
+char g_fileNameToSave[64] = {0};
+char *g_recvBuffer[RECV_BUFFER_COUNT] = {0};
+
+int writeFile(char *name, char *buffer, uint32_t bufferLength);
+void* writeFileThread(void*)
+{
+    while (writeFlag != 2)
+    {
+        if (writeFlag == 1)
+        {
+            if (g_bufferToWrite)
+            {
+                writeFlag = 0;
+                writeFile(g_fileNameToSave, g_bufferToWrite, g_bufferToWriteLength);
+                printf("write data in thread\n");
+            }
+        }
+    }
+}
 
 char *getCurrentTime(char timestamp[], int len)
 {
@@ -43,7 +73,7 @@ int createDir(char *name)
     return 0;
 }
 
-int writeFile(char *name, char *time, char *gzip, uint32_t gzipLength)
+int writeFile(char *name, char *buffer, uint32_t bufferLength)
 {
     char fileName[512] = {0};
     strcpy(fileName, name);
@@ -58,27 +88,15 @@ int writeFile(char *name, char *time, char *gzip, uint32_t gzipLength)
     strcat(fileName, "/");
     strcat(fileName, currentTime);
 
-    /*if (0 != createDir(fileName))
-    {
-        return -1;
-    }
-
-    strcat(fileName, "/");
-    strcat(fileName, time);
-    strcat(fileName, ".gz");*/
-    printf("fileName:%s\n", fileName);
+    printf("write file:%s,len:%d\n", fileName, bufferLength);
     FILE *file = fopen(fileName, "ab");
     if (file)
     {
-        uint32_t len = (uint32_t)(gzipLength+TIME_WIDTH);
-        fwrite((void*)(&len), 1, sizeof(uint32_t), file);
-        fwrite(time, 1, TIME_WIDTH, file);
-        fwrite(gzip, 1, gzipLength, file);
+        fwrite(buffer, 1, bufferLength, file);
         fclose(file);
     }
     return 0;
 }
-
 
 int parsePackage(const char *pack, int packLen, char name[], char time[], char **gzip, int *gzipLen)
 {
@@ -145,9 +163,15 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, writeFileThread, NULL) != 0) {
+        printf("pthread_create error.");
+        exit(EXIT_FAILURE);
+    }
+
     printf("Welcome! This is a UDP server, I can only received message from client and write to file\n");
 
-    char *buff = (char*)malloc(RECV_BUFFER_SIZE);
+    char *buff = (char*)malloc(UDP_BUFFER_SIZE);
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
     size_t len = 0;
@@ -157,9 +181,18 @@ int main(int argc, char** argv)
     char time[TIME_WIDTH+1] = {0};
     char *gzip;
 
+    for (int i=0; i<RECV_BUFFER_COUNT; i++)
+    {
+        g_recvBuffer[i] = (char*)malloc(RECV_BUFFER_SIZE);
+    }
+
+    int recvBufferIndex = 0;
+    int recvBufferLength = 0;
+
+int testIndex = 0;
     while (1)
     {
-        len = recvfrom(sock, buff, RECV_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
+        len = recvfrom(sock, buff, UDP_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
         if (len > 0)
         {
             if (len > HEADER_LENGTH)
@@ -169,8 +202,38 @@ int main(int argc, char** argv)
                 parsePackage(buff, len, name, time, &gzip, &gzipLen);
                 if (gzipLen>0)
                 {
-                   printf("name:%s,time:%s,gliblen:%d\n", name, time, gzipLen);
-                   writeFile(name, time, gzip, gzipLen);
+                    uint32_t len1 = (uint32_t)(gzipLen+TIME_WIDTH);
+					char *ptr = g_recvBuffer[recvBufferIndex];
+                    memcpy(ptr + recvBufferLength, (void*)(&len1), sizeof(uint32_t));
+                    recvBufferLength += sizeof(uint32_t);
+                    memcpy(ptr + recvBufferLength, time, TIME_WIDTH);
+                    recvBufferLength += TIME_WIDTH;
+                    memcpy(ptr + recvBufferLength, gzip, gzipLen);
+					recvBufferLength += gzipLen;
+                    g_bufferToWriteLength = recvBufferLength;
+
+                    if (strlen(g_fileNameToSave) == 0)
+                    {
+                        strcpy(g_fileNameToSave, name);
+                    }
+                    if (recvBufferLength >= WRITE_BUFFER_TO_DISK_SIZE
+                            || strcmp(g_fileNameToSave, name) != 0)
+                    {
+                        g_bufferToWrite = g_recvBuffer[recvBufferIndex];
+                        strcpy(g_fileNameToSave, name);
+                        recvBufferIndex++;
+                        if (recvBufferIndex == RECV_BUFFER_COUNT)
+                        {
+                            recvBufferIndex = 0;
+                        }
+                        recvBufferLength = 0;
+                        writeFlag = 1;
+                    }
+                   //printf("name:%s,time:%s,gliblen:%d\n", name, time, gzipLen);
+                   //writeFile(name, time, gzip, gzipLen);
+testIndex++;
+printf("count:%d\n", testIndex);
+
                 }
                 else
                 {
@@ -190,7 +253,16 @@ int main(int argc, char** argv)
             break;
         }
     }
+    writeFlag = 2;
+    char* rev = NULL;
+    pthread_join(tid, (void **)&rev);
+    printf("%s return.\n", rev);
     free(buff);
     buff = 0;
+    for (int i=0; i<RECV_BUFFER_COUNT; i++)
+    {
+        free(g_recvBuffer[i]);
+        g_recvBuffer[i] = 0;
+    }
     return 0;
 }
