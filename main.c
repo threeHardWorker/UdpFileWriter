@@ -15,7 +15,7 @@
 #include <atomic> 
 
 #define UDP_BUFFER_SIZE 65507
-#define RECV_BUFFER_SIZE (5*1024)
+#define RECV_BUFFER_SIZE (5*1024*1024)
 #define WRITE_BUFFER_TO_DISK_SIZE ((int)(0.8*RECV_BUFFER_SIZE))
 #define NAME_WIDTH 64
 #define RECV_BUFFER_COUNT 2
