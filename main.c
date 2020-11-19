@@ -11,15 +11,15 @@
 #include <sys/types.h> 
 #include <sys/stat.h>
 #include <time.h>
-#include <pthread.h>
 #include <map>
 #include <string>
 #include <mutex> 
 #include <condition_variable>
+#include <thread>
 
 #define UDP_BUFFER_SIZE 65507
-#define RECV_BUFFER_SIZE (5*1024)
-#define WRITE_BUFFER_TO_DISK_SIZE ((int)(0.8*RECV_BUFFER_SIZE))
+#define RECV_BUFFER_SIZE (5*1024*1024)
+#define WRITE_BUFFER_TO_DISK_SIZE ((uint32_t)(0.8*RECV_BUFFER_SIZE))
 #define NAME_WIDTH 64
 #define RECV_BUFFER_COUNT 2
 
@@ -34,15 +34,12 @@ BufferWriter *findBufferWriter(const char *name);
 
 std::map<std::string, BufferWriter *> g_bufferWriters;
 
-std::mutex g_mutex;
-int g_newUdpData = 0;
-std::condition_variable g_dataCondition;
-
 class BufferWriter 
 {
 public:
     BufferWriter(const char *name) 
     {
+        m_count = 0;
         m_isBufferFull = 0;
         m_recvBufferPos = 0;
         m_bufferToWrite = NULL;
@@ -52,13 +49,13 @@ public:
         {
             m_recvBuffer[i] = new char[RECV_BUFFER_SIZE];
         }
+        
+        m_threadHandle = new std::thread(&BufferWriter::loopFlush, this);
     }
     
     ~BufferWriter()
-    {
-        m_isBufferFull = 1;
-        flush();
-        
+    {   
+        stop();
         for (int i=0; i<RECV_BUFFER_COUNT; i++)
         {
             delete m_recvBuffer[i];
@@ -75,11 +72,11 @@ public:
         memcpy(ptr + m_recvBufferPos, "\n", 1);
         m_recvBufferPos += 1;
         m_bufferToWriteLength = m_recvBufferPos;
-
-        m_count++;
         
+        m_count++;
         if (m_recvBufferPos >= WRITE_BUFFER_TO_DISK_SIZE)
         {
+            std::lock_guard<std::mutex> lk(m_mutex);
             m_bufferToWrite = m_recvBuffer[m_recvBufferIndex];
             m_recvBufferIndex++;
             if (m_recvBufferIndex == RECV_BUFFER_COUNT)
@@ -88,23 +85,48 @@ public:
             }
             m_recvBufferPos = 0;
             m_isBufferFull = 1;
+            m_dataCondition.notify_one();
         }
         return 0;
     }
     
+    void loopFlush()
+    {
+        while (m_stop == 0)
+        {
+            std::unique_lock<std::mutex> lk(m_mutex);
+            m_dataCondition.wait(lk, [&]{return m_isBufferFull == 1;});
+            flush();
+            lk.unlock();
+        }
+    }
+    
     int flush()
     {
-        if (m_isBufferFull && m_bufferToWrite)
+        if (m_bufferToWrite && m_bufferToWriteLength>0)
         {
             writeFile(m_name, m_bufferToWrite, m_bufferToWriteLength);
             printf("write data in thread (%s,%d,%d)\n", m_name, m_bufferToWriteLength, m_count);
             m_bufferToWrite = NULL;
             m_bufferToWriteLength = 0;
-            m_isBufferFull = 0;
             m_count = 0;
+            m_isBufferFull = 0;
             return 0;
         }
         return -1;
+    }
+    
+    void stop()
+    {
+        m_isBufferFull = 1;
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_dataCondition.notify_one();
+        if (m_threadHandle)
+        {
+            m_threadHandle->join();
+        }
+        delete m_threadHandle;
+        m_threadHandle = NULL;
     }
     
 private:
@@ -112,10 +134,16 @@ private:
     char *m_bufferToWrite = NULL;
     char m_name[NAME_WIDTH] = {0};
     uint32_t m_bufferToWriteLength = 0;
-    int m_isBufferFull = 0;
-    int m_recvBufferIndex = 0;
-    int m_recvBufferPos = 0;
+    uint32_t m_recvBufferIndex = 0;
+    uint32_t m_recvBufferPos = 0;
     uint32_t m_count = 0;
+    
+    int m_stop = 0;
+    
+    std::thread *m_threadHandle = NULL;
+    std::mutex m_mutex;
+    int m_isBufferFull = 0;
+    std::condition_variable m_dataCondition;
 };
 
 BufferWriter *findBufferWriter(const char *name)
@@ -200,7 +228,6 @@ int writeFile(char *name, char *buffer, uint32_t bufferLength)
         return -1;
     }
     
-    //strcat(fileName, "/");
     strcat(fileName, name);
     char currentTime[64] = {0};
     getCurrentTime(currentTime, sizeof(currentTime));
@@ -234,18 +261,6 @@ int parsePackage(const char *pack, int packLen, char name[], int nameLen, char *
     return -1;
 }
 
-void* flushBufferThread(void* flag)
-{
-    while (true)
-    {
-        std::unique_lock<std::mutex> lk(g_mutex);
-        g_dataCondition.wait(lk, []{return g_newUdpData == 1;});
-        flushBufferWriters();
-        lk.unlock();
-    }
-    return 0;
-}
-
 int main(int argc, char** argv)
 {
     if (argc != 2)
@@ -275,13 +290,6 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
     
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, flushBufferThread, NULL) != 0) 
-    {
-        printf("pthread_create error.");
-        exit(EXIT_FAILURE);
-    }
-    
     printf("Welcome! This is a UDP server, I can only received message from client and write to file\n");
     
     char *buff = new char[UDP_BUFFER_SIZE];
@@ -301,12 +309,9 @@ int main(int argc, char** argv)
             char *dataPos = 0;
             int ret = parsePackage(buff, len, name, NAME_WIDTH, &dataPos);
             if (ret == 0)
-            {	
+            {
                 BufferWriter *bufferWriter = findBufferWriter(name);
-                std::lock_guard<std::mutex> lk(g_mutex);
                 bufferWriter->buffer(dataPos, strlen(dataPos));
-                g_newUdpData = 1;
-                g_dataCondition.notify_one();
             }
             else
             {
@@ -319,9 +324,6 @@ int main(int argc, char** argv)
             break;
         }
     }
-    char* rev = NULL;
-    pthread_join(tid, (void **)&rev);
-    printf("%s return.\n", rev);
     delete buff;
     buff = NULL;
     destroyBufferWriters();
