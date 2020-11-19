@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -12,48 +12,170 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
-#include <atomic> 
+#include <map>
+#include <string>
+#include <mutex> 
+#include <condition_variable>
 
 #define UDP_BUFFER_SIZE 65507
-#define RECV_BUFFER_SIZE (5*1024*1024)
+#define RECV_BUFFER_SIZE (5*1024)
 #define WRITE_BUFFER_TO_DISK_SIZE ((int)(0.8*RECV_BUFFER_SIZE))
 #define NAME_WIDTH 64
 #define RECV_BUFFER_COUNT 2
 
-std::atomic<int> writeFlag(0);
-
-char *g_bufferToWrite = NULL;
-int g_bufferToWriteLength = 0;
-char g_fileNameToSave[64] = {0};
-char *g_recvBuffer[RECV_BUFFER_COUNT] = {0};
-
 int writeFile(char *name, char *buffer, uint32_t bufferLength);
-void* writeFileThread(void*)
+char *getCurrentTime(char timestamp[], int len);
+int createDir(char *name);
+int writeFile(char *name, char *buffer, uint32_t bufferLength);
+void flushBufferWriters();
+
+class BufferWriter;
+BufferWriter *findBufferWriter(const char *name);
+
+std::map<std::string, BufferWriter *> g_bufferWriters;
+
+std::mutex g_mutex;
+int g_newUdpData = 0;
+std::condition_variable g_dataCondition;
+
+class BufferWriter 
 {
-    while (writeFlag != 2)
+public:
+    BufferWriter(const char *name) 
     {
-        if (writeFlag == 1)
+        m_isBufferFull = 0;
+        m_recvBufferPos = 0;
+        m_bufferToWrite = NULL;
+        memset(m_name, 0, sizeof(m_name));
+        strcpy(m_name, name);
+        for (int i=0; i<RECV_BUFFER_COUNT; i++)
         {
-            if (g_bufferToWrite)
-            {
-                writeFlag = 0;
-                writeFile(g_fileNameToSave, g_bufferToWrite, g_bufferToWriteLength);
-                printf("write data in thread\n");
-            }
+            m_recvBuffer[i] = new char[RECV_BUFFER_SIZE];
         }
     }
-    return 0;
+    
+    ~BufferWriter()
+    {
+        m_isBufferFull = 1;
+        flush();
+        
+        for (int i=0; i<RECV_BUFFER_COUNT; i++)
+        {
+            delete m_recvBuffer[i];
+            m_recvBuffer[i] = NULL;
+        }
+    }
+    
+    
+    int buffer(const char *data, uint32_t dataLength)
+    {
+        char *ptr = m_recvBuffer[m_recvBufferIndex];
+        memcpy(ptr + m_recvBufferPos, data, dataLength);
+        m_recvBufferPos += dataLength;
+        memcpy(ptr + m_recvBufferPos, "\n", 1);
+        m_recvBufferPos += 1;
+        m_bufferToWriteLength = m_recvBufferPos;
+
+        m_count++;
+        
+        if (m_recvBufferPos >= WRITE_BUFFER_TO_DISK_SIZE)
+        {
+            m_bufferToWrite = m_recvBuffer[m_recvBufferIndex];
+            m_recvBufferIndex++;
+            if (m_recvBufferIndex == RECV_BUFFER_COUNT)
+            {
+                m_recvBufferIndex = 0;
+            }
+            m_recvBufferPos = 0;
+            m_isBufferFull = 1;
+        }
+        return 0;
+    }
+    
+    int flush()
+    {
+        if (m_isBufferFull && m_bufferToWrite)
+        {
+            writeFile(m_name, m_bufferToWrite, m_bufferToWriteLength);
+            printf("write data in thread (%s,%d,%d)\n", m_name, m_bufferToWriteLength, m_count);
+            m_bufferToWrite = NULL;
+            m_bufferToWriteLength = 0;
+            m_isBufferFull = 0;
+            m_count = 0;
+            return 0;
+        }
+        return -1;
+    }
+    
+private:
+    char *m_recvBuffer[RECV_BUFFER_COUNT] = {0};
+    char *m_bufferToWrite = NULL;
+    char m_name[NAME_WIDTH] = {0};
+    uint32_t m_bufferToWriteLength = 0;
+    int m_isBufferFull = 0;
+    int m_recvBufferIndex = 0;
+    int m_recvBufferPos = 0;
+    uint32_t m_count = 0;
+};
+
+BufferWriter *findBufferWriter(const char *name)
+{
+    BufferWriter *bufferWriter = NULL;
+    std::map<std::string, BufferWriter*>::iterator it = g_bufferWriters.find(name);
+    if (it == g_bufferWriters.end())
+    {
+        bufferWriter = new BufferWriter(name);
+        g_bufferWriters[name] = bufferWriter;
+    }
+    else
+    {
+        bufferWriter = it->second;
+    }
+    return bufferWriter;			
+}
+
+void destroyBufferWriters()
+{
+    std::map<std::string, BufferWriter*>::iterator it = g_bufferWriters.begin();
+    while (it != g_bufferWriters.end())
+    {
+        BufferWriter *pBufferWriter = it->second;
+        std::string name = it->first;
+        if (pBufferWriter)
+        {
+            delete pBufferWriter;
+            pBufferWriter = NULL;
+            printf("%s destroyed\n", name.c_str());
+        }
+        it++;
+    }
+    g_bufferWriters.clear();
+}
+
+void flushBufferWriters()
+{
+    std::map<std::string, BufferWriter*>::iterator it = g_bufferWriters.begin();
+    while (it != g_bufferWriters.end())
+    {
+        BufferWriter *pBufferWriter = it->second;
+        std::string name = it->first;
+        if (pBufferWriter)
+        {
+            pBufferWriter->flush();
+        }
+        it++;
+    }
 }
 
 char *getCurrentTime(char timestamp[], int len)
 {
-     time_t now = time(0);
-     struct tm ttm;
-     localtime_r(&now, &ttm);
-     snprintf(timestamp, len, "%04d%02d%02d", ttm.tm_year + 1900,
-		 ttm.tm_mon + 1, ttm.tm_mday); 
-     //snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
-     return timestamp;
+    time_t now = time(0);
+    struct tm ttm;
+    localtime_r(&now, &ttm);
+    snprintf(timestamp, len, "%04d%02d%02d", ttm.tm_year + 1900,
+             ttm.tm_mon + 1, ttm.tm_mday); 
+    //snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
+    return timestamp;
 }
 
 int createDir(char *name)
@@ -77,7 +199,7 @@ int writeFile(char *name, char *buffer, uint32_t bufferLength)
         printf("error:create dir %s failed", fileName);
         return -1;
     }
-
+    
     //strcat(fileName, "/");
     strcat(fileName, name);
     char currentTime[64] = {0};
@@ -85,7 +207,7 @@ int writeFile(char *name, char *buffer, uint32_t bufferLength)
     strcat(fileName, "-");
     strcat(fileName, currentTime);
     strcat(fileName, ".csv");
-
+    
     printf("write file:%s,len:%d\n", fileName, bufferLength);
     FILE *file = fopen(fileName, "ab");
     if (file)
@@ -101,17 +223,29 @@ int parsePackage(const char *pack, int packLen, char name[], int nameLen, char *
     char *ptr = (char*)pack;
     for (int i=0; i<packLen && i<nameLen; i++,ptr++)
     {
-       if (*ptr == ',')
-       {
-          name[i] = '\0';
-          *dataPos = ptr+1;
-          return 0;
-       }
-       name[i] = *ptr;
+        if (*ptr == ',')
+        {
+            name[i] = '\0';
+            *dataPos = ptr+1;
+            return 0;
+        }
+        name[i] = *ptr;
     }
     return -1;
 }
- 
+
+void* flushBufferThread(void* flag)
+{
+    while (true)
+    {
+        std::unique_lock<std::mutex> lk(g_mutex);
+        g_dataCondition.wait(lk, []{return g_newUdpData == 1;});
+        flushBufferWriters();
+        lk.unlock();
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2)
@@ -119,50 +253,44 @@ int main(int argc, char** argv)
         perror("Usage: asc <udp port>\n Example:\n   UdpFileWriter 8899\n");
         return EXIT_FAILURE;
     }
-
+    
     const char *port = argv[1];
- 
+    
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(atoi(port));
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
- 
+    
     int sock;
     if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
     {
         perror("socket");
         return EXIT_FAILURE;
     }
-
+    
     //port bind to server
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("bind");
         return EXIT_FAILURE;
     }
-
+    
     pthread_t tid;
-    if (pthread_create(&tid, NULL, writeFileThread, NULL) != 0) {
+    if (pthread_create(&tid, NULL, flushBufferThread, NULL) != 0) 
+    {
         printf("pthread_create error.");
         exit(EXIT_FAILURE);
     }
-
+    
     printf("Welcome! This is a UDP server, I can only received message from client and write to file\n");
-
-    char *buff = (char*)malloc(UDP_BUFFER_SIZE);
+    
+    char *buff = new char[UDP_BUFFER_SIZE];
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
     size_t len = 0;
     socklen_t socklen = sizeof(clientAddr);
-    for (int i=0; i<RECV_BUFFER_COUNT; i++)
-    {
-        g_recvBuffer[i] = (char*)malloc(RECV_BUFFER_SIZE);
-    }
-
-    int recvBufferIndex = 0;
-    int recvBufferLength = 0;
+    
     char name[NAME_WIDTH] = {0};
-    int testIndex = 0;
     while (1)
     {
         memset(buff, 0, UDP_BUFFER_SIZE);
@@ -172,45 +300,18 @@ int main(int argc, char** argv)
             memset(name, 0, NAME_WIDTH);
             char *dataPos = 0;
             int ret = parsePackage(buff, len, name, NAME_WIDTH, &dataPos);
-            //printf("%s=%s\n", buff, dataPos);
             if (ret == 0)
-            {
-                char *ptr = g_recvBuffer[recvBufferIndex];
-                len = strlen(dataPos);
-                memcpy(ptr + recvBufferLength, dataPos, len);
-                recvBufferLength += len;
-                memcpy(ptr + recvBufferLength, "\n", 1);
-                recvBufferLength += 1;
-                g_bufferToWriteLength = recvBufferLength;
-
-                if (strlen(g_fileNameToSave) == 0)
-                {
-                    strcpy(g_fileNameToSave, name);
-                }
-                testIndex++;
-                if (recvBufferLength >= WRITE_BUFFER_TO_DISK_SIZE
-                   || strcmp(g_fileNameToSave, name) != 0)
-                {
-                    g_bufferToWrite = g_recvBuffer[recvBufferIndex];
-                    strcpy(g_fileNameToSave, name);
-                    recvBufferIndex++;
-                    if (recvBufferIndex == RECV_BUFFER_COUNT)
-                    {
-                        recvBufferIndex = 0;
-                    }
-                    recvBufferLength = 0;
-                    writeFlag = 1;
-                    printf("save count:%d\n", testIndex);
-                 }
-                    
-                 printf("count:%d\n", testIndex);
+            {	
+                BufferWriter *bufferWriter = findBufferWriter(name);
+                std::lock_guard<std::mutex> lk(g_mutex);
+                bufferWriter->buffer(dataPos, strlen(dataPos));
+                g_newUdpData = 1;
+                g_dataCondition.notify_one();
             }
             else
             {
-		printf("error 111 length:%d\n", (int)len);
+                printf("error 111 length:%d(%s)\n", (int)len, buff);
             }
-            //buff[len] = 0;
-            //printf("%s %u says: %s\n", inet_ntoa(clientAddr.sin_addr), ntohs(clientAddr.sin_port), buff);
         }
         else
         {
@@ -218,16 +319,11 @@ int main(int argc, char** argv)
             break;
         }
     }
-    writeFlag = 2;
     char* rev = NULL;
     pthread_join(tid, (void **)&rev);
     printf("%s return.\n", rev);
-    free(buff);
-    buff = 0;
-    for (int i=0; i<RECV_BUFFER_COUNT; i++)
-    {
-        free(g_recvBuffer[i]);
-        g_recvBuffer[i] = 0;
-    }
+    delete buff;
+    buff = NULL;
+    destroyBufferWriters();
     return 0;
 }
