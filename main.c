@@ -176,9 +176,8 @@ int main(int argc, char** argv)
             if (ret == 0)
             {
                 char *ptr = g_recvBuffer[recvBufferIndex];
-                //len = strlen(dataPos);
-                //memcpy(ptr + recvBufferLength, dataPos, len);
-                memcpy(ptr + recvBufferLength, buff, len);
+                len = strlen(dataPos);
+                memcpy(ptr + recvBufferLength, dataPos, len);
                 recvBufferLength += len;
                 memcpy(ptr + recvBufferLength, "\n", 1);
                 recvBufferLength += 1;
