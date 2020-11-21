@@ -227,10 +227,12 @@ void flush()
 
 void* writeFileThread(void*)
 {
-    while (1)
+    // while (1)
     {
         std::unique_lock<std::mutex> lk(m_mutex);
+	printf("waiting for signnal!\n");
         m_dataCondition.wait(lk, [&]{return g_bufferToSave != NULL;});
+	printf("i got it\n");
         flush();
         lk.unlock();
     }
@@ -279,8 +281,6 @@ int main(int argc, char** argv)
         exit(EXIT_FAILURE);
     }
     
-    printf("This is a huobi UDP server, I can only received message from client and write to file\n");
-    
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
     size_t len = 0;
@@ -294,9 +294,11 @@ int main(int argc, char** argv)
     
     uint32_t recvBufferWritePos = 0;
     uint32_t recvBufferIndex = 0;
-    while (1)
+    // while (1)
+    for (int i = 0; i < 100; ++i)
     {
         len = recvfrom(sock, buff, UDP_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
+	printf("%d, %lu\n", i, len);
         if (len > 0)
         {
             char *ptr = g_recvBuffer[recvBufferIndex];
@@ -325,12 +327,16 @@ int main(int argc, char** argv)
             break;
         }
     }
-    char* rev = NULL;
-    pthread_join(tid, (void **)&rev);
-    printf("%s return.\n", rev);
+
+    g_bufferToSave = g_recvBuffer[recvBufferIndex];
+    m_dataCondition.notify_one();
+    
+    // char* rev = NULL;
+    pthread_join(tid, nullptr); // (void **)&rev);
+    // printf("%s return.\n", rev);
     
     free(buff);
-    buff = NULL;
+    buff = nullptr;
     for (int i=0; i<RECV_BUFFER_COUNT; i++)
     {
         free(g_recvBuffer[i]);
