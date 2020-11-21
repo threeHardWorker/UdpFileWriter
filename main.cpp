@@ -16,6 +16,7 @@
 #include <mutex> 
 #include <condition_variable>
 #include <pthread.h>
+#include <signal.h>
 
 #define UDP_BUFFER_SIZE 65507
 #define RECV_BUFFER_SIZE (5*1024*1024)
@@ -26,10 +27,12 @@
 #define DATA_WIDTH 128
 
 int g_currentBufferIndex = 0;
-char *g_bufferToSave = NULL;
+char *g_bufferToSave = nullptr;
 std::mutex m_mutex;
 std::condition_variable m_dataCondition;
 char *g_recvBuffer[RECV_BUFFER_COUNT] = {0};
+int g_stop = 0;
+int g_sock = 0;
 
 int createDir(char *name);
 int writeFile(char *name, char *buffer, uint32_t bufferLength);
@@ -93,14 +96,14 @@ char* parsePackage(const char *pack, char **nameEndPtr, char **dataEndPtr)
     if (strlen(ptr) == 0)
     {
         printf("end parse string\n");
-        return NULL;
+        return nullptr;
     }
     
     int nameEndPos = findPos(ptr, strlen(ptr), ',');
     if (nameEndPos == -1)
     {
         printf("error:can not find name(,):%s\n", ptr);
-        return NULL;
+        return nullptr;
     }
     
     ptr += nameEndPos;//name end
@@ -111,7 +114,7 @@ char* parsePackage(const char *pack, char **nameEndPtr, char **dataEndPtr)
     if (dataEndPos == -1)
     {
         printf("error:can not find end(\n):%s\n", ptr);
-        return NULL;
+        return nullptr;
     }
     
     ptr += dataEndPos;
@@ -134,7 +137,7 @@ std::string getFilePath(const char *name, const char *date)
 
 FILE *getFileHandle(const char *name, const char *currentTime, std::map<std::string, FILE*> *pFiles)
 {
-    FILE *file = NULL;
+    FILE *file = nullptr;
     std::map<std::string, FILE*>::iterator it = pFiles->find(name);
     if (it == pFiles->end())
     {
@@ -178,8 +181,8 @@ void flush()
     char name[NAME_WIDTH] = {0};
     char data[DATA_WIDTH] = {0};
     
-    char *nameEndPtr = NULL;
-    char *dataEndPtr = NULL;
+    char *nameEndPtr = nullptr;
+    char *dataEndPtr = nullptr;
     
     std::map<std::string, FILE*> files;
     
@@ -190,7 +193,7 @@ void flush()
     getCurrentTime(currentTime, sizeof(currentTime));
     printf("\n***begine to save file at %s\n", currentTime);
     uint32_t count = 0;
-    while (ptr != NULL)
+    while (ptr != nullptr)
     {
         char *tmp = parsePackage(ptr, &nameEndPtr, &dataEndPtr);
         if (!tmp)
@@ -222,21 +225,34 @@ void flush()
     getCurrentTime(currentTime, sizeof(currentTime));
     printf("***save count:%d, at %s\n", count, currentTime);
     memset(g_bufferToSave, 0, RECV_BUFFER_SIZE);
-    g_bufferToSave = NULL;
+    g_bufferToSave = nullptr;
 }
 
 void* writeFileThread(void*)
 {
-    // while (1)
+    while (1)
     {
         std::unique_lock<std::mutex> lk(m_mutex);
-	printf("waiting for signnal!\n");
-        m_dataCondition.wait(lk, [&]{return g_bufferToSave != NULL;});
-	printf("i got it\n");
+        m_dataCondition.wait(lk, [&]{return g_bufferToSave != nullptr || g_stop == 1;});
         flush();
         lk.unlock();
+        if (g_stop == 1)
+        {
+            break;
+        }
     }
+    printf("buffer thread exit!!!!\n");
     return 0;
+}
+
+void signalHander(int signum) 
+{
+    printf("catch signal %d\n", signum);
+    g_stop = 1;
+    if (g_sock)
+    {
+        close(g_sock);
+    }
 }
 
 int main(int argc, char** argv)
@@ -246,10 +262,15 @@ int main(int argc, char** argv)
         perror("Usage: asc <udp port>\n Example:\n   UdpFileWriter 8899\n");
         return EXIT_FAILURE;
     }
+
+    signal(SIGINT, signalHander);
+    signal(SIGSTOP, signalHander);
+    signal(SIGKILL, signalHander);
+    signal(SIGQUIT, signalHander);
     
     if (0 != createDir(SAVE_DIR))
     {
-        printf("error:create dir %s failed", SAVE_DIR);
+        printf("error:create dir %s failed!!!", SAVE_DIR);
         return EXIT_FAILURE;
     }
     
@@ -260,24 +281,23 @@ int main(int argc, char** argv)
     addr.sin_port = htons(atoi(port));
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     
-    int sock;
-    if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+    if ((g_sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
     {
         perror("socket");
         return EXIT_FAILURE;
     }
     
     //port bind to server
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    if (bind(g_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
     {
-        perror("bind");
+        perror("bind error");
         return EXIT_FAILURE;
     }
     
     pthread_t tid;
-    if (pthread_create(&tid, NULL, writeFileThread, NULL) != 0) 
+    if (pthread_create(&tid, nullptr, writeFileThread, nullptr) != 0) 
     {
-        printf("pthread_create error.");
+        printf("pthread_create error!!!");
         exit(EXIT_FAILURE);
     }
     
@@ -294,11 +314,9 @@ int main(int argc, char** argv)
     
     uint32_t recvBufferWritePos = 0;
     uint32_t recvBufferIndex = 0;
-    // while (1)
-    for (int i = 0; i < 100; ++i)
+    while (g_stop == 0)
     {
-        len = recvfrom(sock, buff, UDP_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
-	printf("%d, %lu\n", i, len);
+        len = recvfrom(g_sock, buff, UDP_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
         if (len > 0)
         {
             char *ptr = g_recvBuffer[recvBufferIndex];
@@ -328,12 +346,14 @@ int main(int argc, char** argv)
         }
     }
 
-    g_bufferToSave = g_recvBuffer[recvBufferIndex];
-    m_dataCondition.notify_one();
+    {   //to release lock
+        printf("about to exit process...\n");
+        std::lock_guard<std::mutex> lk(m_mutex);
+        g_bufferToSave = g_recvBuffer[recvBufferIndex];
+        m_dataCondition.notify_one();
+    }
     
-    // char* rev = NULL;
-    pthread_join(tid, nullptr); // (void **)&rev);
-    // printf("%s return.\n", rev);
+    pthread_join(tid, nullptr);
     
     free(buff);
     buff = nullptr;
@@ -342,5 +362,6 @@ int main(int argc, char** argv)
         free(g_recvBuffer[i]);
         g_recvBuffer[i] = 0;
     }
+    printf("process exited!!!");
     return 0;
 }
