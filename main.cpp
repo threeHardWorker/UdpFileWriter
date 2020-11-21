@@ -303,7 +303,7 @@ int main(int argc, char** argv)
     
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
-    size_t len = 0;
+    int len = 0;
     socklen_t socklen = sizeof(clientAddr);
     
     char *buff = (char*)(malloc(UDP_BUFFER_SIZE));
