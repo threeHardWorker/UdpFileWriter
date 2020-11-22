@@ -15,45 +15,50 @@
 #include <string>
 #include <mutex> 
 #include <condition_variable>
+#include <sstream>
 #include <pthread.h>
 #include <signal.h>
 
-#define UDP_BUFFER_SIZE 65507
-#define RECV_BUFFER_SIZE (5*1024*1024)
-#define WRITE_BUFFER_TO_DISK_SIZE ((uint32_t)(RECV_BUFFER_SIZE-2*1024))
-#define RECV_BUFFER_COUNT 2
-#define SAVE_DIR ("data/")
-#define NAME_WIDTH 64
-#define DATA_WIDTH 128
+#define BUFFER_SIZE      10    // in Megabytes
+#define RECV_BUFFER_SIZE (BUFFER_SIZE * 1024 * 1024)
+#define MARGIN_LEN       1024
+#define SAVE_DIR         ("data/")
+#define TIME_STR_LEN     64
+#define TIMESTAMP_WIDTH  13
+
+using FILEMAP = std::map<std::string, FILE*>;
 
 int g_currentBufferIndex = 0;
-char *g_bufferToSave = nullptr;
+char *g_saveBuffer = nullptr;
+char *g_recvBuffer = nullptr;
+
 std::mutex m_mutex;
 std::condition_variable m_dataCondition;
-char *g_recvBuffer[RECV_BUFFER_COUNT] = {0};
 int g_stop = 0;
+int g_write = 0;
+
 int g_sock = 0;
 
 int createDir(char *name);
-int writeFile(char *name, char *buffer, uint32_t bufferLength);
+int writeFile(char *name, char *recvbufer, uint32_t recvbuferLength);
 
-char *getCurrentDay(char timestamp[], int len)
+char *getDate(char timestamp[], char* ts, int len)
 {
-    time_t now = time(0);
+    time_t t = (std::stoll(ts) / 1000);
     struct tm ttm;
-    localtime_r(&now, &ttm);
+    localtime_r(&t, &ttm);
     snprintf(timestamp, len, "%04d%02d%02d", ttm.tm_year + 1900,
              ttm.tm_mon + 1, ttm.tm_mday); 
-    //snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
     return timestamp;
 }
 
-char *getCurrentTime(char timestamp[], int len)
+char *getTimestamp(char timestamp[], time_t* t, int len)
 {
-    time_t now = time(0);
     struct tm ttm;
-    localtime_r(&now, &ttm);
-    snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d", ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour, ttm.tm_min, ttm.tm_sec); 
+    localtime_r(t, &ttm);
+    snprintf(timestamp, len, "%04d-%02d-%02dT%02d:%02d:%02d",
+       ttm.tm_year + 1900, ttm.tm_mon + 1, ttm.tm_mday, ttm.tm_hour,
+       ttm.tm_min, ttm.tm_sec); 
     return timestamp;
 }
 
@@ -61,7 +66,8 @@ int createDir(const char *name)
 {
     if (access(name, W_OK) != 0)  
     {  
-        if (mkdir((const char*)name, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == -1)  
+        if (mkdir((const char*)name, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)
+              == -1)
         {   
             perror("mkdir error");   
             return -1;   
@@ -70,78 +76,22 @@ int createDir(const char *name)
     return 0;
 }
 
-int findPos(const char *data, uint32_t dataLength, char c)
-{
-    char *ptr = (char*)data;
-    for (uint32_t i=0; i<dataLength; i++)
-    {
-        if (*ptr == c)
-        {
-            return i;
-        }
-        else if (*ptr == '\0')
-        {
-            return i-1;
-        }
-        
-        ptr++;
-    }
-    return -1;
-}
-
-//pasre data, pack:start of name. nameEndPtr:end of name pos. dataEndPtr:end of data
-char* parsePackage(const char *pack, char **nameEndPtr, char **dataEndPtr)
-{
-    char *ptr = (char*)pack;
-    if (strlen(ptr) == 0)
-    {
-        printf("end parse string\n");
-        return nullptr;
-    }
-    
-    int nameEndPos = findPos(ptr, strlen(ptr), ',');
-    if (nameEndPos == -1)
-    {
-        printf("error:can not find name(,):%s\n", ptr);
-        return nullptr;
-    }
-    
-    ptr += nameEndPos;//name end
-    *nameEndPtr = ptr;
-    ptr += 1; //,
-    
-    int dataEndPos = findPos(ptr, strlen(ptr), '\n');
-    if (dataEndPos == -1)
-    {
-        printf("error:can not find end(\n):%s\n", ptr);
-        return nullptr;
-    }
-    
-    ptr += dataEndPos;
-    *dataEndPtr = ptr;
-    ptr += 1;
-    
-    return ptr;
-}
-
-
 std::string getFilePath(const char *name, const char *date)
 {
-    char fileName[512] = {SAVE_DIR};
-    strcat(fileName, name);
-    strcat(fileName, "-");
-    strcat(fileName, date);
-    strcat(fileName, ".csv");
+    std::string fileName;
+    std::stringstream ss;
+    ss << SAVE_DIR << '/' << name << '-' << date << ".csv";
+    fileName = ss.str();
     return fileName;
 }
 
-FILE *getFileHandle(const char *name, const char *currentTime, std::map<std::string, FILE*> *pFiles)
+FILE *getFileHandle(const char *name, const char *strime, FILEMAP *pFiles)
 {
     FILE *file = nullptr;
-    std::map<std::string, FILE*>::iterator it = pFiles->find(name);
+    auto it = pFiles->find(name);
     if (it == pFiles->end())
     {
-        std::string filePath = getFilePath(name, currentTime);
+        std::string&& filePath = getFilePath(name, strime);
         file = fopen(filePath.c_str(), "ab");
         if (file)
         {
@@ -159,11 +109,10 @@ FILE *getFileHandle(const char *name, const char *currentTime, std::map<std::str
     return file;
 }
 
-void closeFilesHandle(std::map<std::string, FILE*> *pFiles)
+void closeFilesHandle(FILEMAP *pFiles)
 {
     printf("begine to close file\n");
-    std::map<std::string, FILE*>::iterator it = pFiles->begin();
-    while (it != pFiles->end())
+    for(auto it = pFiles->begin(); it != pFiles->end(); ++it)
     {
         FILE *file = it->second;
         if (file)
@@ -171,61 +120,79 @@ void closeFilesHandle(std::map<std::string, FILE*> *pFiles)
             fclose(file);
             printf("close file %s\n", it->first.c_str());
         }
-        it++;
     }
+    pFiles->clear();
 }
 
-void flush()
+void save_data()
 {
-    char *ptr = g_bufferToSave;
-    char name[NAME_WIDTH] = {0};
-    char data[DATA_WIDTH] = {0};
+    char *ptr = g_saveBuffer;
     
-    char *nameEndPtr = nullptr;
-    char *dataEndPtr = nullptr;
+    char *dt = nullptr;
+    char *name = nullptr;
+    char *line_end = strchr(ptr, '\n');
     
-    std::map<std::string, FILE*> files;
+    FILEMAP files;
     
-    char currentDay[64] = {0};
-    getCurrentDay(currentDay, sizeof(currentDay));
+    time_t t = time(0);
+    char strtime[TIME_STR_LEN] = {0};
+    getTimestamp(strtime, &t, TIME_STR_LEN);
+    printf("\n***begine to save file at %s\n", strtime);
     
-    char currentTime[64] = {0};
-    getCurrentTime(currentTime, sizeof(currentTime));
-    printf("\n***begine to save file at %s\n", currentTime);
     uint32_t count = 0;
-    while (ptr != nullptr)
+    while (line_end != nullptr)
     {
-        char *tmp = parsePackage(ptr, &nameEndPtr, &dataEndPtr);
-        if (!tmp)
-        {
+        // get name
+        name = ptr;
+        char* t = strchr(ptr, ',');
+        if (!t) {
+            printf("data error go get name %u\n", count);
             break;
         }
-        
-        memset(name, 0, sizeof(name));
-        memcpy(name, ptr, nameEndPtr-ptr);
-        
-        memset(data, 0, sizeof(data));
-        memcpy(data, nameEndPtr+1, dataEndPtr-nameEndPtr-1);
-        strcat(data, "\n");
-        
-        ptr = tmp;
-        
-        FILE *file = getFileHandle(name, currentDay, &files);
+        *t++ = '\0';
+
+        // data ptr
+        ptr = dt = t;
+        t = strchr(ptr, ',');
+        if (!t) {
+            printf("data error go get timestamp %u\n", count);
+            break;
+        }
+
+        // get the date
+        *t = '\0';
+        getDate(strtime, dt, TIME_STR_LEN);
+        *t = ',';
+
+        // find the data-end
+        *line_end = '\0';
+
+        FILE *file = getFileHandle(name, strtime, &files);
         if (!file)
         {
             printf("error to open file %s!!!!!\n", name);
             continue;
         }
-        fwrite(data, strlen(data), 1, file);
+        if (fwrite(ptr, strlen(ptr), 1, file) != 1) {
+            printf("error to fwrite data %u\n", count);
+            g_stop = 1;
+            break;
+        }
         count++;
-        //printf("index:%d,name:%s,data:%s", g_count, name, data);
+
+#ifdef DEBUG
+        printf("index:%d,name:%s,data:%s\n", count, name, ptr);
+#endif //DEBUG
+
+        ptr = line_end + 1;
+        line_end = strchr(ptr, '\n');
     }
-    
+
     closeFilesHandle(&files);
-    getCurrentTime(currentTime, sizeof(currentTime));
-    printf("***save count:%d, at %s\n", count, currentTime);
-    memset(g_bufferToSave, 0, RECV_BUFFER_SIZE);
-    g_bufferToSave = nullptr;
+
+    t = time(0);
+    getTimestamp(strtime, &t, TIME_STR_LEN);
+    printf("***save count:%d, at %s\n", count, strtime);
 }
 
 void* writeFileThread(void*)
@@ -233,15 +200,13 @@ void* writeFileThread(void*)
     while (1)
     {
         std::unique_lock<std::mutex> lk(m_mutex);
-        m_dataCondition.wait(lk, [&]{return g_bufferToSave != nullptr || g_stop == 1;});
-        flush();
+        m_dataCondition.wait(lk, [&]{return (g_write || g_stop);});
+        save_data();
+        g_write = 0;
         lk.unlock();
-        if (g_stop == 1)
-        {
-            break;
-        }
+        if (g_stop) break;
     }
-    printf("buffer thread exit!!!!\n");
+    printf("recvbufer thread exit!!!!\n");
     return 0;
 }
 
@@ -250,9 +215,7 @@ void signalHander(int signum)
     printf("catch signal %d\n", signum);
     g_stop = 1;
     if (g_sock)
-    {
         close(g_sock);
-    }
 }
 
 int main(int argc, char** argv)
@@ -262,6 +225,13 @@ int main(int argc, char** argv)
         perror("Usage: asc <udp port>\n Example:\n   UdpFileWriter 8899\n");
         return EXIT_FAILURE;
     }
+
+    char* all_buf = (char*)malloc(RECV_BUFFER_SIZE * 2);
+    g_recvBuffer = all_buf;
+    g_saveBuffer = all_buf + RECV_BUFFER_SIZE;
+    char* end_pos = g_recvBuffer + RECV_BUFFER_SIZE - MARGIN_LEN;
+    char* recvbuf = g_recvBuffer;
+    uint32_t recvbuf_len = RECV_BUFFER_SIZE;
 
     signal(SIGINT, signalHander);
     signal(SIGSTOP, signalHander);
@@ -303,39 +273,56 @@ int main(int argc, char** argv)
     
     struct sockaddr_in clientAddr;
     memset(&clientAddr,0,sizeof(clientAddr));
-    size_t len = 0;
+    int len = 0;
     socklen_t socklen = sizeof(clientAddr);
     
-    char *buff = (char*)(malloc(UDP_BUFFER_SIZE));
-    for (int i=0; i<RECV_BUFFER_COUNT; i++)
-    {
-        g_recvBuffer[i] = (char*)malloc(RECV_BUFFER_SIZE);
-    }
-    
-    uint32_t recvBufferWritePos = 0;
-    uint32_t recvBufferIndex = 0;
+#ifdef DEBUG 
+    uint32_t k = 0;
+#endif //DEBUG
+
     while (g_stop == 0)
     {
-        len = recvfrom(g_sock, buff, UDP_BUFFER_SIZE, 0, (struct sockaddr*)&clientAddr, &socklen);
+        len = recvfrom(g_sock, recvbuf, recvbuf_len, 0,
+		       (struct sockaddr*)&clientAddr, &socklen);
         if (len > 0)
         {
-            char *ptr = g_recvBuffer[recvBufferIndex];
-            memcpy(ptr + recvBufferWritePos, buff, len);
-            recvBufferWritePos += len;
-            memcpy(ptr + recvBufferWritePos, "\n\0", 2);
-            recvBufferWritePos += 1;
-            
-            if (recvBufferWritePos >= WRITE_BUFFER_TO_DISK_SIZE) //buffer is full
+            recvbuf += len;
+            *recvbuf++ = '\n'; //append a new-line
+	    recvbuf_len -= (len + 1);
+
+#ifdef DEBUG
+            if ((recvbuf - g_recvBuffer) / 1024 > k) {
+                k = (recvbuf - g_recvBuffer) / 1024;
+                printf("%ld ", (recvbuf - g_recvBuffer));
+                fflush(stdout);
+            }
+#endif // DEBUG
+
+#ifdef DEBUG
+            if (k > 9) // try 10K data to swap recvbufer
+#else
+            if (recvbuf >= end_pos) //recvbufer is full
+#endif //DEBUG
             {
-                std::lock_guard<std::mutex> lk(m_mutex);
-                g_bufferToSave = g_recvBuffer[recvBufferIndex];
-                
-                recvBufferWritePos = 0;
-                recvBufferIndex++;
-                if (recvBufferIndex >= RECV_BUFFER_COUNT)
-                {
-                    recvBufferIndex = 0;
-                }
+                // std::lock_guard<std::mutex> lk(m_mutex);
+
+                // swap recv and save recvbufer
+                char* tmp = g_saveBuffer;
+                g_saveBuffer = g_recvBuffer;
+                g_recvBuffer = tmp;
+
+                // set new recvbuf and recvbufer-len of recvfrom to max length
+                recvbuf = g_recvBuffer;
+                end_pos = g_recvBuffer + RECV_BUFFER_SIZE - MARGIN_LEN;
+                recvbuf_len = RECV_BUFFER_SIZE;
+
+#ifdef DEBUG
+                k = 0;
+                printf("\nrecv recvbufer is %lx, save recvbufer %lx, end pos %lx\n",
+                    (uint64_t)(g_recvBuffer), (uint64_t)(g_saveBuffer),
+                    (uint64_t)(end_pos));
+#endif //DEBUG
+                g_write = 1;
                 m_dataCondition.notify_one();
             }
         }
@@ -348,20 +335,13 @@ int main(int argc, char** argv)
 
     {   //to release lock
         printf("about to exit process...\n");
-        std::lock_guard<std::mutex> lk(m_mutex);
-        g_bufferToSave = g_recvBuffer[recvBufferIndex];
+        g_saveBuffer = g_recvBuffer;
+        g_write = 1;
         m_dataCondition.notify_one();
     }
-    
+
     pthread_join(tid, nullptr);
-    
-    free(buff);
-    buff = nullptr;
-    for (int i=0; i<RECV_BUFFER_COUNT; i++)
-    {
-        free(g_recvBuffer[i]);
-        g_recvBuffer[i] = 0;
-    }
+    free(all_buf);
     printf("process exited!!!");
     return 0;
 }
